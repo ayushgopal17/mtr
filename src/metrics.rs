@@ -230,6 +230,7 @@ pub fn ratio(used: u64, total: u64) -> f64 {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 pub fn bytes(value: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut n = value as f64;
