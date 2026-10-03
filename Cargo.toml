@@ -1,0 +1,22 @@
+[package]
+name = "mtr"
+version = "0.2.0"
+edition = "2021"
+description = "A small, vivid CPU, GPU and memory terminal monitor"
+license = "MIT"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+sysinfo = { version = "0.33", default-features = false, features = ["system", "user"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+core-foundation = "0.10"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
