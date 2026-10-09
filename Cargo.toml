@@ -8,7 +8,7 @@ license = "MIT"
 [dependencies]
 ratatui = "0.29"
 crossterm = "0.28"
-sysinfo = { version = "0.33", default-features = false, features = ["system", "user"] }
+sysinfo = { version = "0.33", default-features = false, features = ["system", "user", "component"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

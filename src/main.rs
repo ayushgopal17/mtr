@@ -4,7 +4,13 @@ mod platform;
 mod ui;
 
 use app::{App, Sort};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::{
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+        MouseEventKind,
+    },
+    execute,
+};
 use std::{
     env,
     error::Error,
@@ -13,7 +19,7 @@ use std::{
     time::Duration,
 };
 
-const HELP: &str = "mtr — CPU · GPU · memory · cache\n\nUsage: mtr [OPTIONS]\n\n  -i, --interval MS   Sampling interval, 250–60000 ms (default: 1000)\n      --json          Print one live JSON sample and exit\n      --benchmark N   Collect N samples and report collection cost (1–1000)\n  -h, --help          Show this help\n  -V, --version       Print version\n\nKeys: q quit · / search · c CPU · m memory · s sort · r reverse\n      ↑/↓ scroll · space pause · ? help\n\nGPU support: Apple IORegistry, Linux AMD DRM and NVIDIA nvidia-smi.\nUnavailable metrics are reported as N/A (JSON null), never fabricated.\n";
+const HELP: &str = "mtr — CPU · GPU · memory · temperature\n\nUsage: mtr [OPTIONS]\n\n  -i, --interval MS   Sampling interval, 250–60000 ms (default: 1000)\n      --json          Print one live JSON sample and exit\n      --benchmark N   Collect N samples and report collection cost (1–1000)\n  -h, --help          Show this help\n  -V, --version       Print version\n\nKeys: q quit · / search · c CPU · m memory · s sort · r reverse\n      ↑/↓ scroll · space pause · ? help\n\nGPU support: Apple IORegistry, Linux AMD DRM and NVIDIA nvidia-smi.\nUnavailable metrics are reported as N/A (JSON null), never fabricated.\n";
 
 #[derive(Debug, PartialEq)]
 struct Options {
@@ -108,11 +114,21 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
     let worker = metrics::Worker::start(interval);
     let mut terminal = ratatui::init();
-    // Ratatui installs panic cleanup. This scope also restores the terminal on
-    // all ordinary error returns before the worker is joined.
-    let result = dashboard(&mut terminal, &worker, options.interval);
+    // Extend Ratatui's panic cleanup to restore normal terminal mouse behavior.
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = execute!(io::stdout(), DisableMouseCapture);
+        previous_hook(info);
+    }));
+    // Capture wheel/trackpad events in the alternate screen, so they scroll
+    // processes instead of moving the terminal into its shell scrollback.
+    let result = execute!(io::stdout(), EnableMouseCapture)
+        .and_then(|()| terminal.clear())
+        .and_then(|()| dashboard(&mut terminal, &worker, options.interval));
+    let cleanup = execute!(io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result?;
+    cleanup?;
     Ok(())
 }
 
@@ -149,6 +165,17 @@ fn dashboard(
         }
         match event::read()? {
             Event::Resize(_, _) => dirty = true,
+            Event::Mouse(mouse) if !app.help && !app.searching => {
+                let delta = match mouse.kind {
+                    MouseEventKind::ScrollUp => -3,
+                    MouseEventKind::ScrollDown => 3,
+                    _ => 0,
+                };
+                if delta != 0 {
+                    app.scroll(delta);
+                    dirty = true;
+                }
+            }
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 dirty = true;
                 if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {

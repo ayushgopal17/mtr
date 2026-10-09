@@ -40,6 +40,7 @@ fn parse_meminfo(text: &str) -> MemoryDetail {
             }),
         compressed_bytes: None,
         label: "Page cache + reclaimable".into(),
+        ..Default::default()
     }
 }
 

@@ -1,16 +1,17 @@
 # mtr
 
-A compact Rust terminal dashboard for CPU, GPU, RAM, swap, cache, and processes.
-An htop-style interface: two columns of CPU meters, compact memory/GPU/cache
-readings, a dense process table, and a function-key command bar.
+A colorful Rust terminal dashboard for CPU, GPU, RAM, temperature, and processes.
+Rounded cyan, violet, green, and amber panels group live readings, CPU and memory
+history graphs, per-core meters, and the hottest available temperature sensors.
+Cache, compressed memory, uptime, filtering, sorting, and keyboard shortcuts stay
+close at hand.
+
+![Dashboard preview with illustrative readings](docs/dashboard-preview.svg)
 Built with [Ratatui](https://ratatui.rs/) and [sysinfo](https://docs.rs/sysinfo/0.33.1/sysinfo/).
 
-**Verification:** compiled and tested on an Apple M1 Mac running macOS 14.8.3
-(Darwin 23.6), with Rust 1.99. The release build, seven unit tests, formatting, and
-Clippy passed. Live CPU, GPU, and memory readings and terminal rendering were
-checked. Linux and Intel Mac execution have not yet been tested locally. Restricted
-OS queries show `N/A`; normal Terminal execution can expose more process data
-than a sandboxed session.
+**Platform support:** macOS and Linux. Sensor access depends on the hardware,
+OS version, and permissions; unavailable readings display `N/A`. Linux and Intel
+Mac execution have not been checked locally for this update.
 
 ## Run
 
@@ -98,10 +99,11 @@ meters. JSON includes every core. Narrow terminals hide VIRT and ELAPSED columns
 | `F5`, `Space` | Pause/resume display |
 | `F6`, `s`, `Tab` | Cycle sort column |
 | `F7`, `c` | Sort CPU |
-| `F8`, `m` | Sort resident memory |
+| `F8`, `m` | Sort displayed memory (macOS footprint; resident elsewhere) |
 | `F9`, `r` | Reverse sort |
 | `F10`, `q`, `Ctrl+C` | Quit |
 | `↑` / `↓`, `j` / `k` | Move selection |
+| Mouse wheel / trackpad | Scroll processes inside the dashboard |
 | `PgUp` / `PgDn`, `Home` / `End` | Page / first / last |
 | `[` / `]` | Previous / next CPU meter page |
 
@@ -110,7 +112,7 @@ shortcuts work without Fn. The default view stays at the top of the ranking;
 after you navigate, selection follows that process across refreshes. Sorting or
 filtering resets selection to the first result.
 
-The process table shows PID, USER, VIRT, RES, state, CPU%, MEM%, ELAPSED, and
+The process table shows PID, USER, VIRT, MEM (RES on Linux), state, CPU%, MEM%, ELAPSED, and
 Command. **ELAPSED is wall time since process start, not accumulated CPU time.**
 VIRT includes reserved address space. `R` means runnable; it does not imply the
 process is currently executing. CPU meter colors indicate total load, not a
@@ -119,12 +121,37 @@ monitor, without process termination or priority-changing commands.
 
 ## Measurements
 
-* **CPU:** system counter deltas via sysinfo, with a warm-up interval before the
-  first reading. Aggregate and each logical core range from 0–100%. Process CPU
-  uses one-core units and can exceed 100% for multithreaded workloads.
-* **Memory:** OS-reported used, available, resident process memory, and swap.
-  Resident memory is not unique ownership: shared pages can be counted in several
-  processes. Some protected processes may expose limited information.
+* **CPU:** checked native per-core Mach counter deltas on macOS, and sysinfo on
+  Linux, with a warm-up interval before the first reading. A failed macOS read
+  clears the baseline; the next successful read warms up again. No zero delta
+  or failed read is represented as 0% CPU. An actual measured idle interval is
+  correctly 0%. Load averages use checked `getloadavg` on macOS. Aggregate and each logical core range from 0–100%. Process CPU
+  uses one-core units and can exceed 100% for multithreaded workloads. These are
+  interval averages, not instantaneous measurements; tools sampled at different
+  times need not match exactly.
+* **Memory:** macOS used RAM is `physical total − free − cached files`, where
+  cached files are `(external + purgeable) × page size`. Available RAM is free
+  plus cached files (reclaimable capacity, not just unused pages). Speculative
+  pages are already included in the kernel's free count and are not added again.
+  App memory is `(internal − purgeable) × page size`; wired and compressed memory
+  use their respective kernel page counts. These three categories do not cover
+  all physical memory: JSON `other_bytes` reports the remaining used memory when
+  that difference is nonnegative. All page counters share one VM statistics
+  sample. Swap comes from `vm.swapusage`. Failed or inconsistent native queries
+  are `N/A` / JSON `null`. Linux uses sysinfo's OS accounting.
+  App, Wired, Compressed, and Cached details are shown in the UI; JSON also
+  preserves file-backed pages separately. K/M/G mean KiB/MiB/GiB (powers of 1024).
+* **Processes:** on macOS, checked `proc_pidinfo(PROC_PIDTASKALLINFO)` reads return
+  resident and virtual sizes. CPU is the delta of user + system Mach ticks divided
+  by elapsed Mach ticks, in one-core units. A new or inaccessible process shows
+  CPU `N/A` until two valid samples exist; start time including microseconds guards
+  against PID reuse. Failed queries never become zero memory readings.
+  macOS `MEM` and memory sorting use `proc_pid_rusage`'s physical footprint, the
+  metric used for Activity Monitor's Memory column. A failed footprint read
+  stays `N/A`; it never falls back to a different memory metric. JSON
+  `memory_footprint` is footprint and `memory` remains resident RAM. Linux uses
+  resident RAM (`RES`). Start time is rechecked across the separate footprint
+  query to reject PID reuse. Shared resident pages may appear in several processes.
 * **macOS cache:** native Mach VM statistics, `external_page_count × page size`
   (file-backed pages). Compressed memory is the physical compressor footprint.
   File-backed pages are not exactly the same as Activity Monitor's Cached Files.
@@ -133,6 +160,15 @@ monitor, without process termination or priority-changing commands.
 * **CPU caches:** hardware L1/L2/L3 capacities, read once. These are not cache
   occupancy, misses, or hit rates. macOS uses `sysctl`; Linux reports the cache
   hierarchy for CPU 0. Heterogeneous cores can have different cache sizes.
+* **Temperature:** sysinfo hardware components (macOS Apple Silicon HID sensors,
+  Intel Mac SMC, or Linux sensors). The panel lists the hottest available sensors
+  in Celsius; `--json` includes every detected sensor with its label. GPU driver
+  temperatures are included when exposed. Invalid, missing, or zero readings are
+  unavailable, never inferred from load. Some Macs/macOS releases expose no
+  sensors; the panel then says `N/A · no sensor readings`. No sudo is required.
+  Green below 70°C, yellow from 70°C, and red from 90°C are visual guides, not
+  hardware-specific thermal limits. Pausing freezes temperatures with the rest
+  of the display.
 * **GPU:** driver-reported utilization and memory; not an estimate based on CPU
   activity. Missing readings are `N/A` / JSON `null`.
 
@@ -152,8 +188,9 @@ use the driver's own sampling window and may differ from CPU's sampling window.
 The default interval is 1 second (configurable from 250 ms to 60 seconds). A
 background collector publishes only the latest snapshot. The UI polls input at
 50 ms and redraws only when data or input changes. History is bounded to 120
-samples. Process refresh requests CPU and memory each interval; executable paths and
-user IDs are fetched once per process. Hardware and user-name metadata are
+samples. Process metadata refreshes each interval; checked native task reads supply
+macOS CPU and memory counters. Executable paths and user IDs are fetched once
+per process. Hardware and user-name metadata are
 collected at startup. NVIDIA collection starts one bounded subprocess per
 sample; native macOS and Linux AMD paths do not spawn commands.
 
@@ -166,7 +203,7 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt
 ```
 
-The header reports collection wall time; it is not the monitor's CPU overhead.
+JSON and benchmark output report collection wall time; it is not the monitor's CPU overhead.
 Measure actual overhead using Activity Monitor or `top` on your machine. No
 performance numbers are claimed before benchmarking. JSON is a diagnostic format
 and its fields may change before version 1.0.
@@ -178,3 +215,16 @@ collectors; `src/app.rs` handles filtering and sorting; `src/ui.rs` draws the
 dashboard. CI checks macOS and Linux builds, tests, and Clippy.
 
 MIT licensed.
+
+### Comparing with Activity Monitor
+
+Compare the same PID, with both apps using a similar refresh interval. mtr defaults
+to 1 second; its `--interval` option sets the interval in milliseconds. Activity
+Monitor offers update frequencies in its View menu. The programs poll independently,
+so changing workloads cannot be guaranteed to produce identical displayed numbers.
+No offset, smoothing, or invented value is used to force agreement. Temperature and
+GPU readings remain hardware/driver reported; Activity Monitor does not provide a
+Celsius sensor reference for validating temperature calibration.
+
+Apple documents the [physical-footprint metric and `proc_pid_rusage`](https://developer.apple.com/videos/play/wwdc2022/10106/)
+and [Activity Monitor update frequencies](https://support.apple.com/en-ie/guide/activity-monitor/actmntr2224/mac).

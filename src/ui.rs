@@ -1,10 +1,10 @@
 use crate::{
     app::{App, Sort},
-    metrics::{ratio, Process},
+    metrics::{memory_ratio, Process},
 };
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap},
+    widgets::{Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Sparkline, Table, Wrap},
 };
 
 // ANSI colors also work in macOS Terminal, which does not require true color.
@@ -14,6 +14,8 @@ const CYAN: Color = Color::Cyan;
 const GREEN: Color = Color::Green;
 const YELLOW: Color = Color::Yellow;
 const RED: Color = Color::Red;
+const VIOLET: Color = Color::LightMagenta;
+const SURFACE: Color = Color::Black;
 
 fn style(color: Color) -> Style {
     Style::default().fg(color)
@@ -40,6 +42,9 @@ fn compact(value: u64) -> String {
     } else {
         format!("{n:.2}{}", units[unit])
     }
+}
+fn optional_bytes(value: Option<u64>) -> String {
+    value.map(compact).unwrap_or_else(|| "N/A".into())
 }
 fn elapsed(seconds: u64) -> String {
     if seconds >= 86400 {
@@ -81,36 +86,41 @@ fn meter(
     let filled = (fraction.unwrap_or(0.0).clamp(0.0, 1.0) * bars as f64).round() as usize;
     let line = Line::from(vec![
         Span::styled(format!("{label:>4}"), style(CYAN).bold()),
-        Span::styled("[", style(TEXT)),
-        Span::styled("|".repeat(filled), style(color)),
-        Span::raw(" ".repeat(bars.saturating_sub(filled))),
+        Span::raw(" "),
+        Span::styled("━".repeat(filled), style(color)),
+        Span::styled("─".repeat(bars.saturating_sub(filled)), style(MUTED)),
         Span::styled(value, style(CYAN).bold()),
-        Span::styled("]", style(TEXT)),
+        Span::raw(" "),
     ]);
     f.render_widget(Paragraph::new(line), area);
 }
 
+fn panel(f: &mut Frame, area: Rect, title: &str, color: Color) -> Rect {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(style(color))
+        .title(Line::from(format!(" {title} ")).style(style(color).bold()));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    inner
+}
+
 pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
-    f.render_widget(Block::default().style(style(TEXT).bg(Color::Reset)), area);
+    f.render_widget(Block::default().style(style(TEXT).bg(SURFACE)), area);
     if area.width < 60 || area.height < 16 {
         text(f, area, "mtr\nResize to at least 60 × 16.\nq to quit", CYAN);
         return;
     }
-    let core_rows = app
-        .snapshot
-        .cores
-        .len()
-        .div_ceil(2)
-        .max(1)
-        .min(usize::from(area.height.saturating_sub(12) / 2).max(1));
-    let top_height = core_rows as u16 + 5;
+    let detail_height = area.height.saturating_sub(14).clamp(3, 8);
     let sections = Layout::vertical([
         Constraint::Length(1),
-        Constraint::Length(top_height),
+        Constraint::Length(5),
+        Constraint::Length(detail_height),
         Constraint::Length(1),
         Constraint::Length(1),
-        Constraint::Min(2),
+        Constraint::Min(3),
         Constraint::Length(1),
     ])
     .split(area);
@@ -127,195 +137,307 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     } else {
         "LIVE"
     };
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(" mtr ", style(SURFACE).bg(CYAN).bold()),
+            Span::styled(
+                format!("  ● {state}  "),
+                style(if state == "LIVE" { GREEN } else { YELLOW }),
+            ),
+            Span::styled(
+                format!(
+                    "{} · {} · {}ms",
+                    app.snapshot.host, app.snapshot.cpu_name, app.interval_ms
+                ),
+                style(TEXT),
+            ),
+        ])),
+        sections[0],
+    );
+    let s = &app.snapshot;
     text(
         f,
-        sections[0],
-        format!(
-            " mtr  {}  ·  {}  ·  {}  ·  {}ms",
-            app.snapshot.host, app.snapshot.cpu_name, state, app.interval_ms
-        ),
+        sections[3],
+        if cfg!(target_os = "macos") {
+            format!(
+                " App {} · Wired {} · Compressed {} · Cached {} · Up {}",
+                optional_bytes(s.memory_detail.app_bytes),
+                optional_bytes(s.memory_detail.wired_bytes),
+                optional_bytes(s.memory_detail.compressed_bytes),
+                optional_bytes(s.memory_detail.cached_files_bytes),
+                s.uptime.map(elapsed).unwrap_or_else(|| "N/A".into())
+            )
+        } else {
+            format!(
+                " {} {} · Compressed {} · Up {} · {:.1}ms",
+                if s.memory_detail.label.is_empty() {
+                    "Cache"
+                } else {
+                    &s.memory_detail.label
+                },
+                s.memory_detail
+                    .cache_bytes
+                    .map(compact)
+                    .unwrap_or_else(|| "N/A".into()),
+                s.memory_detail
+                    .compressed_bytes
+                    .map(compact)
+                    .unwrap_or_else(|| "N/A".into()),
+                s.uptime.map(elapsed).unwrap_or_else(|| "N/A".into()),
+                s.collection_ms
+            )
+        },
         MUTED,
     );
-    summary(f, sections[1], app, core_rows);
-    let tab = Line::from(vec![
-        Span::styled(" Main ", style(Color::Black).bg(GREEN).bold()),
-        Span::styled(
-            format!(
-                "  {} {}  |  {}/{} processes{}",
-                app.sort.label(),
-                if app.reversed { "↑" } else { "↓" },
-                app.visible.len(),
-                app.snapshot.processes.len(),
-                if app.query.is_empty() {
-                    String::new()
-                } else {
-                    format!("  /{}", app.query)
-                }
+    overview(f, sections[1], app);
+    details(f, sections[2], app);
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(" PROCESSES ", style(SURFACE).bg(VIOLET).bold()),
+            Span::styled(
+                format!(
+                    "  {} {}  ·  {}/{} tasks  {}",
+                    app.sort.label(),
+                    if app.reversed { "↑" } else { "↓" },
+                    app.visible.len(),
+                    app.snapshot.processes.len(),
+                    if app.query.is_empty() {
+                        String::new()
+                    } else {
+                        format!("/{}", app.query)
+                    }
+                ),
+                style(VIOLET),
             ),
-            style(CYAN),
-        ),
-    ]);
-    f.render_widget(Paragraph::new(tab), sections[3]);
-    app.process_rows = usize::from(sections[4].height.saturating_sub(1));
-    processes(f, sections[4], app);
-    footer(f, sections[5], app);
+        ])),
+        sections[4],
+    );
+    app.process_rows = usize::from(sections[5].height.saturating_sub(1));
+    processes(f, sections[5], app);
+    footer(f, sections[6], app);
     if app.help {
         help(f);
     }
 }
 
-fn summary(f: &mut Frame, area: Rect, app: &mut App, core_rows: usize) {
-    let cols = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .spacing(2)
-        .split(area);
+fn recent_history(history: &std::collections::VecDeque<u64>, width: u16) -> Vec<u64> {
+    history
+        .iter()
+        .skip(history.len().saturating_sub(usize::from(width)))
+        .copied()
+        .collect()
+}
+
+fn overview(f: &mut Frame, area: Rect, app: &App) {
+    let cols = Layout::horizontal([
+        Constraint::Percentage(34),
+        Constraint::Percentage(33),
+        Constraint::Percentage(33),
+    ])
+    .split(area);
     let s = &app.snapshot;
-    let per_page = core_rows * 2;
-    let pages = s.cores.len().div_ceil(per_page).max(1);
-    app.core_page = app.core_page.min(pages - 1);
-    for column in 0..2 {
-        for r in 0..core_rows {
-            let index = app.core_page * per_page + column * core_rows + r;
-            if let Some(usage) = s.cores.get(index) {
-                meter(
-                    f,
-                    row(cols[column], r as u16),
-                    &index.to_string(),
-                    Some(f64::from(*usage) / 100.0),
-                    format!("{usage:5.1}%"),
-                    heat(f64::from(*usage)),
-                );
-            }
-        }
-    }
-    let base = core_rows as u16;
-    let ready = s.sequence > 0;
-    meter(
+    let cpu = panel(f, cols[0], "CPU", CYAN);
+    text(
         f,
-        row(cols[0], base),
-        "Mem",
-        ready.then(|| ratio(s.memory_used, s.memory_total)),
-        if ready {
-            format!("{}/{}", compact(s.memory_used), compact(s.memory_total))
+        row(cpu, 0),
+        if s.sequence == 0 {
+            " Sampling…".into()
         } else {
-            "sampling".into()
+            format!(
+                " {}  ·  {} cores",
+                s.cpu_usage
+                    .map(|v| format!("{v:.1}%"))
+                    .unwrap_or_else(|| "N/A".into()),
+                s.cores.len()
+            )
         },
-        GREEN,
-    );
-    meter(
-        f,
-        row(cols[0], base + 1),
-        "Swp",
-        ready.then(|| ratio(s.swap_used, s.swap_total)),
-        if ready {
-            format!("{}/{}", compact(s.swap_used), compact(s.swap_total))
-        } else {
-            "sampling".into()
-        },
-        RED,
-    );
-    let gpu = s.gpus.first();
-    meter(
-        f,
-        row(cols[0], base + 2),
-        "GPU",
-        gpu.and_then(|g| g.utilization).map(|v| v / 100.0),
-        gpu.and_then(|g| g.utilization)
-            .map(|v| format!("{v:.1}%"))
-            .unwrap_or_else(|| "N/A".into()),
         CYAN,
     );
-    let gpu_info = gpu
-        .map(|g| {
+    let history = recent_history(&s.cpu_history, cpu.width);
+    f.render_widget(
+        Sparkline::default()
+            .data(&history)
+            .max(100)
+            .style(style(CYAN)),
+        row(cpu, 1),
+    );
+    text(
+        f,
+        row(cpu, 2),
+        if s.sequence == 0 {
+            " Load sampling…".into()
+        } else {
+            s.load
+                .map(|v| format!(" Load {:.2}  {:.2}  {:.2}", v[0], v[1], v[2]))
+                .unwrap_or_else(|| " Load N/A".into())
+        },
+        MUTED,
+    );
+    let ram = panel(f, cols[1], "MEMORY", VIOLET);
+    text(
+        f,
+        row(ram, 0),
+        if s.sequence == 0 {
+            " Sampling…".into()
+        } else {
             format!(
-                "     {}  {}{}{}",
+                " {} / {}",
+                optional_bytes(s.memory_used),
+                optional_bytes(s.memory_total)
+            )
+        },
+        VIOLET,
+    );
+    let history = recent_history(&s.memory_history, ram.width);
+    f.render_widget(
+        Sparkline::default()
+            .data(&history)
+            .max(100)
+            .style(style(VIOLET)),
+        row(ram, 1),
+    );
+    text(
+        f,
+        row(ram, 2),
+        format!(
+            " Swap {} / {}",
+            optional_bytes(s.swap_used),
+            optional_bytes(s.swap_total)
+        ),
+        MUTED,
+    );
+    let gpu = panel(f, cols[2], "GPU", GREEN);
+    let g = s.gpus.first();
+    meter(
+        f,
+        row(gpu, 0),
+        "GPU",
+        g.and_then(|g| g.utilization).map(|v| v / 100.0),
+        g.and_then(|g| g.utilization)
+            .map(|v| format!("{v:.1}%"))
+            .unwrap_or_else(|| "N/A".into()),
+        GREEN,
+    );
+    text(
+        f,
+        row(gpu, 1),
+        g.map(|g| {
+            format!(
+                " {}{}",
                 g.name,
-                g.memory_used.map(compact).unwrap_or_else(|| "N/A".into()),
-                if g.source.contains("shared") {
-                    " shared"
-                } else {
-                    " VRAM"
-                },
                 if s.gpus.len() > 1 {
-                    format!("  +{} GPUs (--json)", s.gpus.len() - 1)
+                    format!(" +{} GPUs", s.gpus.len() - 1)
                 } else {
                     String::new()
                 }
             )
         })
-        .unwrap_or_else(|| "     GPU telemetry unavailable".into());
-    text(f, row(cols[0], base + 3), gpu_info, MUTED);
+        .unwrap_or_else(|| " No GPU telemetry".into()),
+        TEXT,
+    );
     text(
         f,
-        row(cols[0], base + 4),
-        if pages > 1 {
+        row(gpu, 2),
+        g.map(|g| {
             format!(
-                "     CPU page {}/{}  [ / ] change page",
-                app.core_page + 1,
-                pages
+                " {} {}",
+                g.memory_used.map(compact).unwrap_or_else(|| "N/A".into()),
+                if g.source.contains("shared") {
+                    "shared"
+                } else {
+                    "VRAM"
+                }
             )
-        } else {
-            format!(
-                "     CPU {:.1}%  ·  {:.1}ms collect",
-                s.cpu_usage, s.collection_ms
-            )
-        },
+        })
+        .unwrap_or_default(),
         MUTED,
     );
-    let running = s
-        .processes
+}
+
+fn details(f: &mut Frame, area: Rect, app: &mut App) {
+    let cols =
+        Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)]).split(area);
+    let core_rows = usize::from(area.height.saturating_sub(2)).max(1);
+    let per_page = core_rows * 2;
+    let pages = app.snapshot.cores.len().div_ceil(per_page).max(1);
+    app.core_page = app.core_page.min(pages - 1);
+    let title = if pages > 1 {
+        format!("CPU CORES · {}/{} [ / ]", app.core_page + 1, pages)
+    } else {
+        "CPU CORES".into()
+    };
+    let inner = panel(f, cols[0], &title, CYAN);
+    let cores =
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(inner);
+    for (column, col) in cores.iter().enumerate() {
+        for r in 0..core_rows {
+            let index = app.core_page * per_page + column * core_rows + r;
+            if let Some(usage) = app.snapshot.cores.get(index) {
+                meter(
+                    f,
+                    row(*col, r as u16),
+                    &index.to_string(),
+                    usage.map(|v| f64::from(v) / 100.0),
+                    usage
+                        .map(|v| format!("{v:.0}%"))
+                        .unwrap_or_else(|| "N/A".into()),
+                    usage.map(|v| heat(f64::from(v))).unwrap_or(MUTED),
+                );
+            }
+        }
+    }
+    let inner = panel(f, cols[1], "TEMPERATURE · °C", YELLOW);
+    let readings: Vec<_> = app
+        .snapshot
+        .temperatures
         .iter()
-        .filter(|p| matches!(p.status.as_str(), "Run" | "Running" | "Runnable"))
-        .count();
-    text(
-        f,
-        row(cols[1], base),
-        format!("Tasks: {}   {} runnable", s.processes.len(), running),
-        CYAN,
-    );
-    text(
-        f,
-        row(cols[1], base + 1),
-        format!(
-            "Load average: {:.2} {:.2} {:.2}",
-            s.load[0], s.load[1], s.load[2]
-        ),
-        CYAN,
-    );
-    text(
-        f,
-        row(cols[1], base + 2),
-        format!(
-            "Uptime: {}",
-            s.uptime.map(elapsed).unwrap_or_else(|| "N/A".into())
-        ),
-        CYAN,
-    );
-    text(
-        f,
-        row(cols[1], base + 3),
-        format!(
-            "Cache: {}  Compressed: {}",
-            s.memory_detail
-                .cache_bytes
-                .map(compact)
-                .unwrap_or_else(|| "N/A".into()),
-            s.memory_detail
-                .compressed_bytes
-                .map(compact)
-                .unwrap_or_else(|| "N/A".into())
-        ),
-        YELLOW,
-    );
-    text(
-        f,
-        row(cols[1], base + 4),
-        if s.cpu_caches.is_empty() {
-            "CPU cache sizes: N/A".into()
+        .filter(|t| t.celsius.is_some())
+        .collect();
+    if readings.is_empty() {
+        text(
+            f,
+            row(inner, 0),
+            if app.snapshot.sequence == 0 {
+                " Sampling sensors…"
+            } else {
+                " N/A · no sensor readings"
+            },
+            MUTED,
+        );
+        text(f, row(inner, 1), " macOS / hardware dependent", MUTED);
+    } else {
+        // Hottest first; reserve a row for the count when readings overflow.
+        let count = usize::from(inner.height);
+        let shown = if readings.len() > count && count > 1 {
+            count - 1
         } else {
-            s.cpu_caches.clone()
-        },
-        MUTED,
-    );
+            count
+        };
+        for (index, reading) in readings.iter().take(shown).enumerate() {
+            let value = reading.celsius.unwrap();
+            let label: String = reading
+                .label
+                .chars()
+                .take(usize::from(inner.width.saturating_sub(10)))
+                .collect();
+            let line = Line::from(vec![
+                Span::styled(
+                    format!(" {value:4.1}°C "),
+                    style(heat(f64::from(value))).bold(),
+                ),
+                Span::styled(label, style(TEXT)),
+            ]);
+            f.render_widget(Paragraph::new(line), row(inner, index as u16));
+        }
+        if shown < readings.len() && count > 1 {
+            text(
+                f,
+                row(inner, shown as u16),
+                format!(" +{} sensors · --json for all", readings.len() - shown),
+                MUTED,
+            );
+        }
+    }
 }
 
 fn state(p: &Process) -> &'static str {
@@ -333,7 +455,7 @@ fn state(p: &Process) -> &'static str {
 fn processes(f: &mut Frame, area: Rect, app: &mut App) {
     let wide = area.width >= 100;
     let header_cell = |name: &'static str, sorted: bool| {
-        Cell::from(name).style(style(Color::Black).bg(if sorted { CYAN } else { GREEN }))
+        Cell::from(name).style(style(if sorted { CYAN } else { MUTED }).bg(SURFACE).bold())
     };
     let mut headers = vec![
         header_cell("    PID", app.sort == Sort::Pid),
@@ -345,7 +467,14 @@ fn processes(f: &mut Frame, area: Rect, app: &mut App) {
         widths.push(Constraint::Length(8));
     }
     headers.extend([
-        header_cell("     RES", false),
+        header_cell(
+            if cfg!(target_os = "macos") {
+                "     MEM"
+            } else {
+                "     RES"
+            },
+            app.sort == Sort::Memory,
+        ),
         header_cell("S", false),
         header_cell(" CPU%", app.sort == Sort::Cpu),
         header_cell(" MEM%", app.sort == Sort::Memory),
@@ -381,7 +510,7 @@ fn processes(f: &mut Frame, area: Rect, app: &mut App) {
                 cells.push(cell(memory(p.virtual_memory), GREEN));
             }
             cells.extend([
-                cell(memory(p.memory), CYAN),
+                cell(memory(p.displayed_memory()), CYAN),
                 cell(state(p).into(), if state(p) == "R" { GREEN } else { MUTED }),
                 cell(
                     p.cpu
@@ -390,8 +519,8 @@ fn processes(f: &mut Frame, area: Rect, app: &mut App) {
                     TEXT,
                 ),
                 cell(
-                    p.memory
-                        .map(|v| format!("{:>6.1}", ratio(v, app.snapshot.memory_total) * 100.0))
+                    memory_ratio(p.displayed_memory(), app.snapshot.memory_total)
+                        .map(|v| format!("{:>6.1}", v * 100.0))
                         .unwrap_or_else(|| "   N/A".into()),
                     TEXT,
                 ),
@@ -413,12 +542,12 @@ fn processes(f: &mut Frame, area: Rect, app: &mut App) {
                 },
                 TEXT,
             ));
-            Row::new(cells)
+            Row::new(cells).style(style(TEXT))
         })
         .collect();
     let table = Table::new(rows, widths)
         .column_spacing(1)
-        .header(Row::new(headers).style(style(Color::Black).bg(GREEN)))
+        .header(Row::new(headers).style(style(MUTED).bg(SURFACE)))
         .row_highlight_style(style(Color::Black).bg(CYAN));
     f.render_stateful_widget(table, area, &mut app.table);
     if app.visible.is_empty() {
@@ -463,10 +592,7 @@ fn footer(f: &mut Frame, area: Rect, app: &App) {
             continue;
         }
         spans.push(Span::styled(key, style(TEXT)));
-        spans.push(Span::styled(
-            format!("{name:<6}"),
-            style(Color::Black).bg(CYAN),
-        ));
+        spans.push(Span::styled(format!("{name:<6}"), style(CYAN).bg(SURFACE)));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -474,7 +600,7 @@ fn footer(f: &mut Frame, area: Rect, app: &App) {
 fn help(f: &mut Frame) {
     let area = f.area();
     let width = area.width.saturating_sub(4).min(78);
-    let height = area.height.saturating_sub(2).min(22);
+    let height = area.height.saturating_sub(2).min(25);
     let popup = Rect::new(
         area.x + (area.width - width) / 2,
         area.y + (area.height - height) / 2,
@@ -482,7 +608,7 @@ fn help(f: &mut Frame) {
         height,
     );
     f.render_widget(Clear, popup);
-    let text = "KEYBOARD\nF1 / ?       Help             F2 / p      Full paths / names\nF3 / /       Search           F4 / Esc    Clear filter\nF5 / Space   Pause display    F6 / s      Cycle sort column\nF7 / c       Sort CPU         F8 / m      Sort memory\nF9 / r       Reverse sort     F10 / q     Quit\n↑↓ / j k     Move selection   PgUp/PgDn   Scroll one page\nHome / End   First / last     [ / ]       CPU meter pages\nCtrl+C       Quit (also while searching)\nOn Mac, hold Fn if the function keys control brightness or volume.\n\nREADINGS\nCPU meters show total busy time, 0–100%; color indicates load.\nProcess CPU can exceed 100% across cores. RES is resident RAM;\nVIRT includes reserved address space. ELAPSED is wall time, not CPU\ntime. R means runnable, not necessarily executing on a core.\nGPU is driver-reported; Apple GPU memory is shared with RAM.\nCache is file-backed / reclaimable memory, not additional RAM.\nN/A means unavailable. Shared process pages may be counted twice.\n\nPress F1, ? or Esc to close";
+    let text = "KEYBOARD\nF1 / ?       Help             F2 / p      Full paths / names\nF3 / /       Search           F4 / Esc    Clear filter\nF5 / Space   Pause display    F6 / s      Cycle sort column\nF7 / c       Sort CPU         F8 / m      Sort memory\nF9 / r       Reverse sort     F10 / q     Quit\n↑↓ / j k     Move selection   PgUp/PgDn   Scroll one page\nHome / End   First / last     [ / ]       CPU meter pages\nCtrl+C       Quit (also while searching)\nOn Mac, hold Fn if the function keys control brightness or volume.\n\nREADINGS\nCPU meters show total busy time, 0–100%; color indicates load.\nProcess CPU can exceed 100% across cores. MEM is macOS physical footprint; RES elsewhere is resident RAM;\nVIRT includes reserved address space. ELAPSED is wall time, not CPU\ntime. R means runnable, not necessarily executing on a core.\nGPU is driver-reported; Apple GPU memory is shared with RAM.\nTemperatures: hottest sensors first, in °C; all sensors in --json.\nColors: <70 green, 70–89 yellow, ≥90 red (visual guides only).\nMemory units: K/M/G are KiB/MiB/GiB (powers of 1024).\nFile-backed / cache overlaps RAM; do not add it to used RAM.\nN/A means unavailable. Shared process pages may be counted twice.\n\nPress F1, ? or Esc to close";
     f.render_widget(
         Paragraph::new(text)
             .wrap(Wrap { trim: false })
@@ -503,14 +629,21 @@ mod tests {
     use crate::metrics::Snapshot;
     use ratatui::{backend::TestBackend, Terminal};
     #[test]
+    fn graphs_show_the_newest_samples_after_history_fills() {
+        let history = (0..120).collect();
+        assert_eq!(recent_history(&history, 3), vec![117, 118, 119]);
+        assert_eq!(recent_history(&history, 0), Vec::<u64>::new());
+        assert_eq!(recent_history(&history, 200).len(), 120);
+    }
+    #[test]
     fn populated_layout_keeps_table_and_shortcuts_visible() {
         let mut app = App::new(1000);
         app.update(Snapshot {
             sequence: 1,
-            cores: vec![25.0; 8],
+            cores: vec![Some(25.0); 8],
             cpu_name: "Apple M1".into(),
-            memory_total: 8 * 1024 * 1024 * 1024,
-            memory_used: 6 * 1024 * 1024 * 1024,
+            memory_total: Some(8 * 1024 * 1024 * 1024),
+            memory_used: Some(6 * 1024 * 1024 * 1024),
             processes: vec![Process {
                 pid: 42,
                 name: "mtr".into(),
@@ -532,11 +665,19 @@ mod tests {
         assert!(
             screen.contains("Command") && screen.contains("VIRT") && screen.contains("ELAPSED")
         );
-        assert!(screen.contains("/usr/local/bin/mtr") && screen.contains("Tasks: 1"));
+        assert!(screen.contains("/usr/local/bin/mtr") && screen.contains("1/1 tasks"));
         assert!(lines[35].contains("F10Quit"));
-        assert_eq!(buffer[(0, 12)].bg, GREEN);
-        assert_eq!(buffer[(0, 13)].bg, CYAN);
-        assert!(app.process_rows >= 20);
+        assert!(screen.contains("TEMPERATURE") && screen.contains("no sensor readings"));
+        assert!(app.process_rows >= 18);
+        // The populated sensor path must render a genuine Celsius reading.
+        app.snapshot.temperatures = vec![crate::metrics::Temperature {
+            label: "CPU performance core".into(),
+            celsius: Some(72.5),
+        }];
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let screen: String = buffer.content.iter().map(|c| c.symbol()).collect();
+        assert!(screen.contains("72.5°C") && screen.contains("CPU performance core"));
         if let Ok(path) = std::env::var("MTR_TEST_SCREEN") {
             let cells: Vec<_> = buffer.content.iter().map(|c| serde_json::json!({"text":c.symbol(),"fg":format!("{:?}",c.fg),"bg":format!("{:?}",c.bg)})).collect();
             std::fs::write(path, serde_json::to_string(&cells).unwrap()).unwrap();
@@ -547,7 +688,7 @@ mod tests {
         for (w, h) in [(120, 40), (80, 24), (60, 16), (20, 8), (1, 1)] {
             let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
             let mut app = App::new(1000);
-            app.snapshot.cores = vec![100.0; 256];
+            app.snapshot.cores = vec![Some(100.0); 256];
             app.core_page = usize::MAX;
             terminal.draw(|f| draw(f, &mut app)).unwrap();
             app.help = true;

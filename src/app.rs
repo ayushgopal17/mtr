@@ -100,7 +100,7 @@ impl App {
             let (a, b) = (&self.snapshot.processes[*a], &self.snapshot.processes[*b]);
             let ordering = match self.sort {
                 Sort::Cpu => b.cpu.unwrap_or(-1.0).total_cmp(&a.cpu.unwrap_or(-1.0)),
-                Sort::Memory => b.memory.cmp(&a.memory),
+                Sort::Memory => b.displayed_memory().cmp(&a.displayed_memory()),
                 Sort::Pid => a.pid.cmp(&b.pid),
                 Sort::Name => a.name.cmp(&b.name),
             }
@@ -169,6 +169,25 @@ mod tests {
         });
         assert_eq!(app.table.selected(), Some(0));
         assert_eq!(app.processes().next().unwrap().pid, 2);
+    }
+    #[test]
+    fn memory_sort_uses_the_displayed_metric() {
+        let mut app = App::new(1000);
+        let mut a = process(1, 0.0, "A");
+        a.memory = Some(1000);
+        a.memory_footprint = Some(10);
+        let mut b = process(2, 0.0, "B");
+        b.memory = Some(10);
+        b.memory_footprint = Some(1000);
+        app.sort = Sort::Memory;
+        app.update(Snapshot {
+            processes: vec![a, b],
+            ..Default::default()
+        });
+        assert_eq!(
+            app.processes().next().unwrap().pid,
+            if cfg!(target_os = "macos") { 2 } else { 1 }
+        );
     }
     #[test]
     fn selection_tracks_pid_across_samples_and_search() {
